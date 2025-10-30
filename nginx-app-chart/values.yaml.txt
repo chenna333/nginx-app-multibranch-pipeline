@@ -1,15 +1,10 @@
-replicaCount: 1
+replicaCount: 2
 
 image:
-  repository: nginx
-  tag: "1.25"
+  repository: <aws_account_id>.dkr.ecr.us-east-1.amazonaws.com/nginx-app
+  tag: latest
   pullPolicy: IfNotPresent
 
 service:
-  type: ClusterIP
+  type: LoadBalancer
   port: 80
-
-ingress:
-  enabled: false
-
-resources: {}
