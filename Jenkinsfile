@@ -3,21 +3,37 @@ pipeline {
 
     environment {
         AWS_DEFAULT_REGION = 'us-east-1'
-        IMAGE_REPO = '<aws_account_id>.dkr.ecr.us-east-1.amazonaws.com/nginx-app'
+        ACCOUNT_ID = '<aws_account_id>'
+        IMAGE_REPO = "${ACCOUNT_ID}.dkr.ecr.${AWS_DEFAULT_REGION}.amazonaws.com/nginx-app"
         APP_NAME = 'nginx-app'
+        SONARQUBE_ENV = 'SonarQube'  // Jenkins SonarQube server name
     }
 
     stages {
-        stage('Checkout') {
+
+        stage('Checkout Code') {
             steps {
                 checkout scm
+            }
+        }
+
+        stage('SonarQube Static Analysis') {
+            steps {
+                withSonarQubeEnv("${SONARQUBE_ENV}") {
+                    sh '''
+                        sonar-scanner \
+                          -Dsonar.projectKey=$APP_NAME \
+                          -Dsonar.sources=. \
+                          -Dsonar.host.url=$SONAR_HOST_URL \
+                          -Dsonar.login=$SONAR_AUTH_TOKEN
+                    '''
+                }
             }
         }
 
         stage('Build Docker Image') {
             steps {
                 script {
-                    echo "🔨 Building Docker image..."
                     sh 'docker build -t $IMAGE_REPO:$BRANCH_NAME .'
                 }
             }
@@ -26,19 +42,10 @@ pipeline {
         stage('Trivy Image Scan') {
             steps {
                 script {
-                    echo "🔍 Scanning image for vulnerabilities using Trivy..."
-                    // Install Trivy if not already installed
                     sh '''
-                        if ! command -v trivy >/dev/null 2>&1; then
-                            echo "Installing Trivy..."
-                            curl -sfL https://raw.githubusercontent.com/aquasecurity/trivy/main/contrib/install.sh | sh
-                            sudo mv trivy /usr/local/bin/
-                        fi
-
-                        echo "Running Trivy scan on image..."
-                        trivy image --exit-code 0 --severity LOW,MEDIUM --no-progress $IMAGE_REPO:$BRANCH_NAME
-                        trivy image --exit-code 1 --severity HIGH,CRITICAL --no-progress $IMAGE_REPO:$BRANCH_NAME || {
-                            echo "❌ High or Critical vulnerabilities found! Failing build."
+                        echo "🔍 Scanning image for vulnerabilities using Trivy..."
+                        trivy image --exit-code 1 --severity HIGH,CRITICAL $IMAGE_REPO:$BRANCH_NAME || {
+                            echo "❌ Critical vulnerabilities found. Failing build."
                             exit 1
                         }
                     '''
@@ -49,9 +56,9 @@ pipeline {
         stage('Login to ECR') {
             steps {
                 script {
-                    echo "🔑 Logging in to AWS ECR..."
                     sh '''
-                        aws ecr get-login-password --region $AWS_DEFAULT_REGION | docker login --username AWS --password-stdin $IMAGE_REPO
+                        aws ecr get-login-password --region $AWS_DEFAULT_REGION | \
+                        docker login --username AWS --password-stdin ${ACCOUNT_ID}.dkr.ecr.${AWS_DEFAULT_REGION}.amazonaws.com
                     '''
                 }
             }
@@ -60,20 +67,37 @@ pipeline {
         stage('Push Image to ECR') {
             steps {
                 script {
-                    echo "🚀 Pushing image to ECR..."
-                    sh '''
-                        docker push $IMAGE_REPO:$BRANCH_NAME
-                    '''
+                    sh 'docker push $IMAGE_REPO:$BRANCH_NAME'
                 }
             }
         }
 
-        stage('Deploy to EKS with Helm') {
+        stage('Configure EKS Cluster Access') {
             steps {
                 script {
-                    echo "⚙️ Deploying to EKS using Helm..."
+                    def cluster_name = ""
+                    if (env.BRANCH_NAME == 'dev') {
+                        cluster_name = "eks-dev-cluster"
+                    } else if (env.BRANCH_NAME == 'qa') {
+                        cluster_name = "eks-qa-cluster"
+                    } else if (env.BRANCH_NAME == 'stg') {
+                        cluster_name = "eks-stg-cluster"
+                    } else if (env.BRANCH_NAME == 'prod') {
+                        cluster_name = "eks-prod-cluster"
+                    }
+
+                    sh "aws eks update-kubeconfig --name ${cluster_name} --region ${AWS_DEFAULT_REGION}"
+                }
+            }
+        }
+
+        stage('Helm Deploy to EKS') {
+            steps {
+                script {
                     sh '''
                         helm upgrade --install $APP_NAME ./helm/nginx-app \
+                          --namespace $BRANCH_NAME \
+                          --create-namespace \
                           --set image.repository=$IMAGE_REPO \
                           --set image.tag=$BRANCH_NAME
                     '''
@@ -84,10 +108,8 @@ pipeline {
 
     post {
         always {
-            echo '✅ Pipeline execution completed.'
-        }
-        failure {
-            echo '❌ Pipeline failed. Check above logs for details.'
+            echo "✅ Pipeline completed for branch: ${BRANCH_NAME}"
+            cleanWs()
         }
     }
 }
