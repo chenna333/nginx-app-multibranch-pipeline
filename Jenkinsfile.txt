@@ -1,79 +1,97 @@
 pipeline {
-    agent any
-
-    environment {
-        AWS_DEFAULT_REGION = 'us-east-1'
-        HELM_VERSION = '3.15.3'
+  agent any
+  environment {
+    REGISTRY = "localhost:5000"
+    IMAGE_NAME = "${env.REGISTRY}/chenna333/nginx-app"
+  }
+  options {
+    buildDiscarder(logRotator(numToKeepStr: '10'))
+    timestamps()
+  }
+  stages {
+    stage('Checkout') {
+      steps {
+        checkout scm
+        script {
+          COMMIT = sh(returnStdout: true, script: 'git rev-parse --short HEAD').trim()
+          IMAGE_TAG = "${env.BUILD_NUMBER}-${COMMIT}"
+          env.IMAGE_TAG = IMAGE_TAG
+        }
+      }
     }
 
-    stages {
-        stage('Checkout') {
-            steps {
-                echo "Checking out application repository..."
-                checkout scm
-            }
-        }
-
-        stage('Setup Helm') {
-            steps {
-                echo "Installing Helm if not present..."
-                sh '''
-                    if ! command -v helm >/dev/null 2>&1; then
-                        curl https://get.helm.sh/helm-v${HELM_VERSION}-linux-amd64.tar.gz -o helm.tar.gz
-                        tar -zxvf helm.tar.gz
-                        sudo mv linux-amd64/helm /usr/local/bin/
-                    fi
-                    helm version
-                '''
-            }
-        }
-
-        stage('Login to EKS Cluster') {
-            steps {
-                script {
-                    def envName = env.BRANCH_NAME.trim()
-                    echo "Logging in to ${envName} EKS cluster..."
-                    sh """
-                        aws eks update-kubeconfig --name ${envName}-eks-cluster --region ${AWS_DEFAULT_REGION}
-                        kubectl config current-context
-                    """
-                }
-            }
-        }
-
-        stage('Create Namespace (if missing)') {
-            steps {
-                script {
-                    def envName = env.BRANCH_NAME.trim()
-                    sh """
-                        kubectl get ns ${envName} || kubectl create ns ${envName}
-                    """
-                }
-            }
-        }
-
-        stage('Helm Deploy NGINX') {
-            steps {
-                script {
-                    def envName = env.BRANCH_NAME.trim()
-                    echo "Deploying NGINX to ${envName} namespace..."
-                    sh """
-                        helm upgrade --install nginx-app ./nginx-app \
-                          --namespace ${envName} \
-                          --set image.tag=1.25 \
-                          --wait
-                    """
-                }
-            }
-        }
+    stage('Static IaC Analysis (tfsec)') {
+      agent { label 'docker' }
+      steps {
+        sh '''
+          if [ -d terraform ]; then
+            docker run --rm -v $(pwd)/terraform:/src -w /src aquasec/tfsec:latest .
+          else
+            echo "No terraform folder, skipping tfsec."
+          fi
+        '''
+      }
+      post {
+        unsuccessful { error "tfsec found critical issues" }
+      }
     }
 
-    post {
-        success {
-            echo "✅ Successfully deployed NGINX to ${env.BRANCH_NAME} environment."
+    stage('Docker Build & Push') {
+      steps {
+        script {
+          sh '''
+            docker build -t ${IMAGE_NAME}:${IMAGE_TAG} ./application
+            docker tag ${IMAGE_NAME}:${IMAGE_TAG} ${IMAGE_NAME}:latest
+            docker push ${IMAGE_NAME}:${IMAGE_TAG}
+            docker push ${IMAGE_NAME}:latest
+          '''
         }
-        failure {
-            echo "❌ Deployment failed for ${env.BRANCH_NAME}."
-        }
+      }
     }
+
+    stage('Image Scan (Trivy)') {
+      steps {
+        sh '''
+          docker run --rm -v /var/run/docker.sock:/var/run/docker.sock aquasec/trivy:latest image --exit-code 1 --no-progress ${IMAGE_NAME}:${IMAGE_TAG} || true
+        '''
+      }
+      post {
+        always {
+          archiveArtifacts artifacts: '**/trivy-report*', allowEmptyArchive: true
+        }
+      }
+    }
+
+    stage('Deploy to Staging') {
+      steps {
+        script {
+          sh '''
+            kubectl apply -n staging -f kubernetes/manifests/staging/
+            kubectl rollout status deployment/nginx-app -n staging --timeout=120s
+          '''
+        }
+      }
+    }
+
+    stage('Promote to Production (manual)') {
+      when { branch 'main' }
+      steps {
+        input message: "Approve promotion to production?", ok: "Promote"
+        sh '''
+          kubectl apply -n production -f kubernetes/manifests/production/
+          kubectl rollout status deployment/nginx-app -n production --timeout=120s
+        '''
+      }
+    }
+  }
+
+  post {
+    failure {
+      echo "Build failed - consider rollback steps"
+      // optional rollback logic could be invoked here
+    }
+    success {
+      echo "Pipeline completed successfully"
+    }
+  }
 }
