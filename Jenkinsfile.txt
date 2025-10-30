@@ -1,0 +1,79 @@
+pipeline {
+    agent any
+
+    environment {
+        AWS_DEFAULT_REGION = 'us-east-1'
+        HELM_VERSION = '3.15.3'
+    }
+
+    stages {
+        stage('Checkout') {
+            steps {
+                echo "Checking out application repository..."
+                checkout scm
+            }
+        }
+
+        stage('Setup Helm') {
+            steps {
+                echo "Installing Helm if not present..."
+                sh '''
+                    if ! command -v helm >/dev/null 2>&1; then
+                        curl https://get.helm.sh/helm-v${HELM_VERSION}-linux-amd64.tar.gz -o helm.tar.gz
+                        tar -zxvf helm.tar.gz
+                        sudo mv linux-amd64/helm /usr/local/bin/
+                    fi
+                    helm version
+                '''
+            }
+        }
+
+        stage('Login to EKS Cluster') {
+            steps {
+                script {
+                    def envName = env.BRANCH_NAME.trim()
+                    echo "Logging in to ${envName} EKS cluster..."
+                    sh """
+                        aws eks update-kubeconfig --name ${envName}-eks-cluster --region ${AWS_DEFAULT_REGION}
+                        kubectl config current-context
+                    """
+                }
+            }
+        }
+
+        stage('Create Namespace (if missing)') {
+            steps {
+                script {
+                    def envName = env.BRANCH_NAME.trim()
+                    sh """
+                        kubectl get ns ${envName} || kubectl create ns ${envName}
+                    """
+                }
+            }
+        }
+
+        stage('Helm Deploy NGINX') {
+            steps {
+                script {
+                    def envName = env.BRANCH_NAME.trim()
+                    echo "Deploying NGINX to ${envName} namespace..."
+                    sh """
+                        helm upgrade --install nginx-app ./nginx-app \
+                          --namespace ${envName} \
+                          --set image.tag=1.25 \
+                          --wait
+                    """
+                }
+            }
+        }
+    }
+
+    post {
+        success {
+            echo "✅ Successfully deployed NGINX to ${env.BRANCH_NAME} environment."
+        }
+        failure {
+            echo "❌ Deployment failed for ${env.BRANCH_NAME}."
+        }
+    }
+}
