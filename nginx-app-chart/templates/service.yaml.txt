@@ -4,8 +4,8 @@ metadata:
   name: {{ include "nginx-app.fullname" . }}
 spec:
   type: {{ .Values.service.type }}
-  selector:
-    app: {{ include "nginx-app.name" . }}
   ports:
     - port: {{ .Values.service.port }}
       targetPort: 80
+  selector:
+    app: {{ include "nginx-app.name" . }}
