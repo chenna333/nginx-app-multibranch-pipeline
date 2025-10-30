@@ -1,97 +1,63 @@
 pipeline {
-  agent any
-  environment {
-    REGISTRY = "localhost:5000"
-    IMAGE_NAME = "${env.REGISTRY}/chenna333/nginx-app"
-  }
-  options {
-    buildDiscarder(logRotator(numToKeepStr: '10'))
-    timestamps()
-  }
-  stages {
-    stage('Checkout') {
-      steps {
-        checkout scm
-        script {
-          COMMIT = sh(returnStdout: true, script: 'git rev-parse --short HEAD').trim()
-          IMAGE_TAG = "${env.BUILD_NUMBER}-${COMMIT}"
-          env.IMAGE_TAG = IMAGE_TAG
+    agent any
+
+    environment {
+        AWS_DEFAULT_REGION = 'us-east-1'
+        IMAGE_REPO = '<aws_account_id>.dkr.ecr.us-east-1.amazonaws.com/nginx-app'
+        APP_NAME = 'nginx-app'
+    }
+
+    stages {
+        stage('Checkout') {
+            steps {
+                checkout scm
+            }
         }
-      }
-    }
 
-    stage('Static IaC Analysis (tfsec)') {
-      agent { label 'docker' }
-      steps {
-        sh '''
-          if [ -d terraform ]; then
-            docker run --rm -v $(pwd)/terraform:/src -w /src aquasec/tfsec:latest .
-          else
-            echo "No terraform folder, skipping tfsec."
-          fi
-        '''
-      }
-      post {
-        unsuccessful { error "tfsec found critical issues" }
-      }
-    }
-
-    stage('Docker Build & Push') {
-      steps {
-        script {
-          sh '''
-            docker build -t ${IMAGE_NAME}:${IMAGE_TAG} ./application
-            docker tag ${IMAGE_NAME}:${IMAGE_TAG} ${IMAGE_NAME}:latest
-            docker push ${IMAGE_NAME}:${IMAGE_TAG}
-            docker push ${IMAGE_NAME}:latest
-          '''
+        stage('Build Docker Image') {
+            steps {
+                script {
+                    sh 'docker build -t $IMAGE_REPO:$BRANCH_NAME .'
+                }
+            }
         }
-      }
+
+        stage('Login to ECR') {
+            steps {
+                script {
+                    sh '''
+                        aws ecr get-login-password --region $AWS_DEFAULT_REGION | docker login --username AWS --password-stdin $IMAGE_REPO
+                    '''
+                }
+            }
+        }
+
+        stage('Push Image to ECR') {
+            steps {
+                script {
+                    sh '''
+                        docker push $IMAGE_REPO:$BRANCH_NAME
+                    '''
+                }
+            }
+        }
+
+        stage('Deploy to EKS with Helm') {
+            steps {
+                script {
+                    sh '''
+                        helm upgrade --install $APP_NAME ./helm/nginx-app \
+                          --set image.repository=$IMAGE_REPO \
+                          --set image.tag=$BRANCH_NAME
+                    '''
+                }
+            }
+        }
     }
 
-    stage('Image Scan (Trivy)') {
-      steps {
-        sh '''
-          docker run --rm -v /var/run/docker.sock:/var/run/docker.sock aquasec/trivy:latest image --exit-code 1 --no-progress ${IMAGE_NAME}:${IMAGE_TAG} || true
-        '''
-      }
-      post {
+    post {
         always {
-          archiveArtifacts artifacts: '**/trivy-report*', allowEmptyArchive: true
+            echo 'Pipeline execution completed.'
         }
-      }
     }
-
-    stage('Deploy to Staging') {
-      steps {
-        script {
-          sh '''
-            kubectl apply -n staging -f kubernetes/manifests/staging/
-            kubectl rollout status deployment/nginx-app -n staging --timeout=120s
-          '''
-        }
-      }
-    }
-
-    stage('Promote to Production (manual)') {
-      when { branch 'main' }
-      steps {
-        input message: "Approve promotion to production?", ok: "Promote"
-        sh '''
-          kubectl apply -n production -f kubernetes/manifests/production/
-          kubectl rollout status deployment/nginx-app -n production --timeout=120s
-        '''
-      }
-    }
-  }
-
-  post {
-    failure {
-      echo "Build failed - consider rollback steps"
-      // optional rollback logic could be invoked here
-    }
-    success {
-      echo "Pipeline completed successfully"
-    }
-  }
 }
