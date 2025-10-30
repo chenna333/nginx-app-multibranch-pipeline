@@ -2,8 +2,6 @@ apiVersion: apps/v1
 kind: Deployment
 metadata:
   name: {{ include "nginx-app.fullname" . }}
-  labels:
-    app: {{ include "nginx-app.name" . }}
 spec:
   replicas: {{ .Values.replicaCount }}
   selector:
